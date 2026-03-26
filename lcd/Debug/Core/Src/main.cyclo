@@ -1,0 +1,8 @@
+../Core/Src/main.c:63:6:DrawPianoKeys	5
+../Core/Src/main.c:87:6:LightUpKey	5
+../Core/Src/main.c:103:6:UpdateFallingNotes	3
+../Core/Src/main.c:146:5:main	1
+../Core/Src/main.c:173:6:SystemClock_Config	3
+../Core/Src/main.c:208:13:MX_SPI1_Init	2
+../Core/Src/main.c:228:13:MX_GPIO_Init	1
+../Core/Src/main.c:251:6:Error_Handler	1

@@ -27,11 +27,13 @@
 #include "usbd_cdc_if.h"
 #include <sys/_intsup.h>
 #include <stdio.h>
+#include "ST7735.h"
+#include "GFX_FUNCTIONS.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+extern FontDef Font_7x10;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -108,6 +110,16 @@ const CorrectionPoint MIC_RESPONSE[] = {
 
 #define TABLE_SIZE (sizeof(MIC_RESPONSE) / sizeof(CorrectionPoint))
 
+#define DISP_WIDTH 160
+#define DISP_HEIGHT 128
+#define NUM_KEYS 8
+#define KEY_WIDTH  (DISP_WIDTH / NUM_KEYS)
+#define KEY_HEIGHT 70  // Shorter keys so boxes have room to fall
+#define KEYS_Y     (DISP_HEIGHT - KEY_HEIGHT) // Keys start at y=88
+#define WHITE_KEY_COLOR WHITE
+#define BLACK_KEY_COLOR BLACK
+#define GREY_TEXT color565(128, 128, 128)
+
 // 2. The Raw Text Buffer (4KB is plenty for ~200 notes)
 char usb_rx_buffer[4096]; 
 int usb_rx_index = 0;
@@ -165,13 +177,16 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
 TIM_HandleTypeDef htim2;
-
+SPI_HandleTypeDef hspi1;
 /* USER CODE BEGIN PV */
-
+uint8_t demo_song[] = {2, 1, 0, 1, 2, 2, 2};
+int current_note_idx = 0;
+int falling_box_y = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+static void MX_SPI1_Init(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
@@ -191,6 +206,83 @@ void Process_Audio(float32_t* output_array);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+void DrawPianoKeys(void) {
+    // 1. Draw 8 White Keys at the bottom
+    for(int i = 0; i < NUM_KEYS; i++) {
+        int x = i * KEY_WIDTH;
+        fillRect(x, KEYS_Y, KEY_WIDTH - 1, KEY_HEIGHT, WHITE_KEY_COLOR);
+
+        // Label the keys in grey
+        char* notes[] = {"C", "D", "E", "F", "G", "A", "B", "C"};
+        // Note: If Font_7x10 causes an error, your font might be named differently.
+        ST7735_WriteString(x + 5, KEYS_Y + 20, notes[i], Font_7x10, GREY_TEXT, WHITE_KEY_COLOR);
+    }
+
+    // 2. Draw the Black Keys on top
+    for(int i = 0; i < NUM_KEYS - 1; i++) {
+        if(i == 2 || i == 6) continue;
+
+        int black_x = (i * KEY_WIDTH) + 15;
+        int black_width = 10;
+        int black_height = KEY_HEIGHT * 2 / 3;
+
+        fillRect(black_x, KEYS_Y, black_width, black_height, BLACK_KEY_COLOR);
+    }
+}
+
+void LightUpKey(uint8_t keyIndex, uint16_t color) {
+    if(keyIndex >= NUM_KEYS) return;
+
+    int x = keyIndex * KEY_WIDTH;
+    fillRect(x, KEYS_Y, KEY_WIDTH - 1, KEY_HEIGHT, color);
+
+    for(int i = 0; i < NUM_KEYS - 1; i++) {
+        if(i == 2 || i == 6) continue;
+        int black_x = (i * KEY_WIDTH) + 15;
+        int black_width = 10;
+        int black_height = KEY_HEIGHT * 2 / 3;
+        fillRect(black_x, KEYS_Y, black_width, black_height, BLACK_KEY_COLOR);
+    }
+}
+
+// Function to handle the game animation loop
+void UpdateFallingNotes(void) {
+    uint8_t target_key = demo_song[current_note_idx];
+    int box_x = (target_key * KEY_WIDTH) + 2;
+    int box_w = KEY_WIDTH - 5;
+    int box_h = 10;
+    int drop_speed = 5;
+
+    // Erase the old box position
+    fillRect(box_x, falling_box_y, box_w, box_h, BLACK);
+
+    // Move box down
+    falling_box_y += drop_speed;
+
+    // Check if it hit the keys
+    if (falling_box_y >= KEYS_Y - box_h) {
+        // Hit! Light up the target key
+        LightUpKey(target_key, GREEN);
+        HAL_Delay(250); // Hold the lit key
+
+        // Redraw keys normally
+        DrawPianoKeys();
+
+        // Reset box to top and move to next note
+        falling_box_y = 0;
+        current_note_idx++;
+
+        if (current_note_idx >= sizeof(demo_song)) {
+            current_note_idx = 0; // Loop the song
+        }
+
+        HAL_Delay(300); // Pause before next note falls
+    } else {
+        // Draw the new box position
+        fillRect(box_x, falling_box_y, box_w, box_h, color565(0, 255, 255)); // Cyan box
+        HAL_Delay(30); // Control the framerate of the fall
+    }
+}
 /* USER CODE BEGIN 0 */
 
 /* USER CODE END 0 */
@@ -226,11 +318,14 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
+  MX_SPI1_Init();
   MX_USB_DEVICE_Init();
   MX_TIM2_Init();
   DSP_Init();
   /* USER CODE BEGIN 2 */
-  
+  ST7735_Init(1);
+  fillScreen(BLACK);
+  DrawPianoKeys();
 //int indexx = 0;
 //  int thirdd = 0;
   
@@ -250,6 +345,7 @@ int main(void)
     HAL_ADC_Start_DMA(&hadc1,adc_dma_buffer,FFT_LENGTH);
     HAL_TIM_Base_Start(&htim2);
 
+    UpdateFallingNotes();
     while (buffer_ready_flag == 0) {
       // Wait for DMA to complete
     }
@@ -431,6 +527,25 @@ void SystemClock_Config(void)
   * @param None
   * @retval None
   */
+static void MX_SPI1_Init(void)
+{
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_1LINE;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
 static void MX_ADC1_Init(void)
 {
 
@@ -556,14 +671,20 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2|GPIO_PIN_5|GPIO_PIN_10, GPIO_PIN_RESET);
-
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
   /*Configure GPIO pins : PA2 PA5 PA10 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_5|GPIO_PIN_10;
+  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_5|GPIO_PIN_9|GPIO_PIN_10;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
