@@ -56,6 +56,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     "${CMAKE_SOURCE_DIR}/Drivers/CMSIS_DSP/Source/TransformFunctions/arm_bitreversal.c"
     "${CMAKE_SOURCE_DIR}/Drivers/CMSIS_DSP/Source/TransformFunctions/arm_bitreversal2.S"
     "${CMAKE_SOURCE_DIR}/Drivers/CMSIS_DSP/Source/TransformFunctions/arm_cfft_init_f32.c"
+    "${CMAKE_SOURCE_DIR}/Drivers/CMSIS_DSP/Source/BasicMathFunctions/arm_dot_prod_f32.c"
 )
 
 # Add include paths
