@@ -13,7 +13,7 @@ uint8_t _ystart;
 
   const uint8_t
   init_cmds1[] = {            // Init for 7735R, part 1 (red or green tab)
-    15,                       // 15 commands in list:
+    14,                       // 14 commands (was 15 in upstream; 15th read past end of table)
     ST7735_SWRESET,   DELAY,  //  1: Software reset, 0 args, w/delay
       150,                    //     150 ms delay
     ST7735_SLPOUT ,   DELAY,  //  2: Out of sleep mode, 0 args, w/delay

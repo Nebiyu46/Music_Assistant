@@ -18,7 +18,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "arm_math_types.h"
 #include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -29,6 +28,8 @@
 #include <stdio.h>
 #include "ST7735.h"
 #include "GFX_FUNCTIONS.h"
+#include "stm32f4xx_hal_spi.h" 
+#include "stm32f4xx_it.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -176,8 +177,10 @@ float32_t magnitude_buffer[FFT_LENGTH / 2];
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
-TIM_HandleTypeDef htim2;
 SPI_HandleTypeDef hspi1;
+
+TIM_HandleTypeDef htim2;
+
 /* USER CODE BEGIN PV */
 uint8_t demo_song[] = {2, 1, 0, 1, 2, 2, 2};
 int current_note_idx = 0;
@@ -186,104 +189,28 @@ int falling_box_y = 0;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void MX_SPI1_Init(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
-void Get_Note_Name(float freq, char* output_buffer, int* midi_note);
-void Apply_Mic_Correction(float32_t* mag_buffer, float sample_rate, int fft_length);
-void Send_Data_To_PC(float32_t* data_array, int length, int save_number);
-void YIN_GetPitch(float* input_buffer, int buffer_len, int sample_rate, float32_t* output_array);
+static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 
 //uint32_t Mic_Read_Single_Sample(void);
 void DSP_Init();
 void Process_Audio(float32_t* output_array);
-
+void Get_Note_Name(float freq, char* output_buffer, int* midi_note);
+void Apply_Mic_Correction(float32_t* mag_buffer, float sample_rate, int fft_length);
+void Send_Data_To_PC(float32_t* data_array, int length, int save_number);
+void YIN_GetPitch(float* input_buffer, int buffer_len, int sample_rate, float32_t* output_array);
+void DrawPianoKeys(void);
+void LightUpKey(uint8_t keyIndex, uint16_t color);
+void UpdateFallingNotes(void) ;
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-void DrawPianoKeys(void) {
-    // 1. Draw 8 White Keys at the bottom
-    for(int i = 0; i < NUM_KEYS; i++) {
-        int x = i * KEY_WIDTH;
-        fillRect(x, KEYS_Y, KEY_WIDTH - 1, KEY_HEIGHT, WHITE_KEY_COLOR);
-
-        // Label the keys in grey
-        char* notes[] = {"C", "D", "E", "F", "G", "A", "B", "C"};
-        // Note: If Font_7x10 causes an error, your font might be named differently.
-        ST7735_WriteString(x + 5, KEYS_Y + 20, notes[i], Font_7x10, GREY_TEXT, WHITE_KEY_COLOR);
-    }
-
-    // 2. Draw the Black Keys on top
-    for(int i = 0; i < NUM_KEYS - 1; i++) {
-        if(i == 2 || i == 6) continue;
-
-        int black_x = (i * KEY_WIDTH) + 15;
-        int black_width = 10;
-        int black_height = KEY_HEIGHT * 2 / 3;
-
-        fillRect(black_x, KEYS_Y, black_width, black_height, BLACK_KEY_COLOR);
-    }
-}
-
-void LightUpKey(uint8_t keyIndex, uint16_t color) {
-    if(keyIndex >= NUM_KEYS) return;
-
-    int x = keyIndex * KEY_WIDTH;
-    fillRect(x, KEYS_Y, KEY_WIDTH - 1, KEY_HEIGHT, color);
-
-    for(int i = 0; i < NUM_KEYS - 1; i++) {
-        if(i == 2 || i == 6) continue;
-        int black_x = (i * KEY_WIDTH) + 15;
-        int black_width = 10;
-        int black_height = KEY_HEIGHT * 2 / 3;
-        fillRect(black_x, KEYS_Y, black_width, black_height, BLACK_KEY_COLOR);
-    }
-}
-
-// Function to handle the game animation loop
-void UpdateFallingNotes(void) {
-    uint8_t target_key = demo_song[current_note_idx];
-    int box_x = (target_key * KEY_WIDTH) + 2;
-    int box_w = KEY_WIDTH - 5;
-    int box_h = 10;
-    int drop_speed = 5;
-
-    // Erase the old box position
-    fillRect(box_x, falling_box_y, box_w, box_h, BLACK);
-
-    // Move box down
-    falling_box_y += drop_speed;
-
-    // Check if it hit the keys
-    if (falling_box_y >= KEYS_Y - box_h) {
-        // Hit! Light up the target key
-        LightUpKey(target_key, GREEN);
-        HAL_Delay(250); // Hold the lit key
-
-        // Redraw keys normally
-        DrawPianoKeys();
-
-        // Reset box to top and move to next note
-        falling_box_y = 0;
-        current_note_idx++;
-
-        if (current_note_idx >= sizeof(demo_song)) {
-            current_note_idx = 0; // Loop the song
-        }
-
-        HAL_Delay(300); // Pause before next note falls
-    } else {
-        // Draw the new box position
-        fillRect(box_x, falling_box_y, box_w, box_h, color565(0, 255, 255)); // Cyan box
-        HAL_Delay(30); // Control the framerate of the fall
-    }
-}
-/* USER CODE BEGIN 0 */
 
 /* USER CODE END 0 */
 
@@ -318,11 +245,11 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
-  MX_SPI1_Init();
   MX_USB_DEVICE_Init();
   MX_TIM2_Init();
-  DSP_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
+  DSP_Init();
   ST7735_Init(1);
   fillScreen(BLACK);
   DrawPianoKeys();
@@ -345,8 +272,9 @@ int main(void)
     HAL_ADC_Start_DMA(&hadc1,adc_dma_buffer,FFT_LENGTH);
     HAL_TIM_Base_Start(&htim2);
 
-    UpdateFallingNotes();
+    
     while (buffer_ready_flag == 0) {
+      UpdateFallingNotes();
       // Wait for DMA to complete
     }
     //copy dma buffer to input buffer
@@ -369,8 +297,8 @@ int main(void)
     YIN_GetPitch(yin_input_buffer,FFT_LENGTH,12000, peaks_from_yin);
 
     Process_Audio(peaks_from_fft);
-    char msg[500];
-    char mssg[500];
+    char msg[128];
+    char mssg[128];
     int yin_len = sprintf(msg, "YIN Dominant Frequency: %.2f Hz , %.2f Hz, %.2f Hz\r\n", peaks_from_yin[0], peaks_from_yin[1], peaks_from_yin[2]);
     CDC_Transmit_FS((uint8_t*)msg, yin_len);
     HAL_Delay(5);
@@ -527,25 +455,6 @@ void SystemClock_Config(void)
   * @param None
   * @retval None
   */
-static void MX_SPI1_Init(void)
-{
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_1LINE;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 10;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
 static void MX_ADC1_Init(void)
 {
 
@@ -590,6 +499,44 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_1LINE;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
 
 }
 
@@ -669,22 +616,27 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
-  /*Configure GPIO pins : PA2 PA5 PA10 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_5|GPIO_PIN_9|GPIO_PIN_10;
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(TFT_CS_GPIO_Port, TFT_CS_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PA2 PA9 PA10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_9|GPIO_PIN_10;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  /*Configure GPIO pin : TFT_CS_Pin */
+  GPIO_InitStruct.Pin = TFT_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(TFT_CS_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -714,7 +666,6 @@ uint32_t Mic_Read_Single_Sample(void){
 
 
 
-/* USER CODE BEGIN 4 */
 // This function runs every time USB data arrives (Interrupt context)
 void USB_Data_Receiver(uint8_t* Buf, uint32_t Len) {
     
@@ -1095,6 +1046,84 @@ void YIN_GetPitch(float* input_buffer, int buffer_len, int sample_rate, float32_
     // STEP 5: Convert Period to Frequency
     // ==============================================================================
     //float pitch_in_hz = (float)sample_rate / refined_tau;
+}
+
+void DrawPianoKeys(void) {
+    // 1. Draw 8 White Keys at the bottom
+    for(int i = 0; i < NUM_KEYS; i++) {
+        int x = i * KEY_WIDTH;
+        fillRect(x, KEYS_Y, KEY_WIDTH - 1, KEY_HEIGHT, WHITE_KEY_COLOR);
+
+        // Label the keys in grey
+        char* notes[] = {"C", "D", "E", "F", "G", "A", "B", "C"};
+        // Note: If Font_7x10 causes an error, your font might be named differently.
+        ST7735_WriteString(x + 5, KEYS_Y + 20, notes[i], Font_7x10, GREY_TEXT, WHITE_KEY_COLOR);
+    }
+
+    // 2. Draw the Black Keys on top
+    for(int i = 0; i < NUM_KEYS - 1; i++) {
+        if(i == 2 || i == 6) continue;
+
+        int black_x = (i * KEY_WIDTH) + 15;
+        int black_width = 10;
+        int black_height = KEY_HEIGHT * 2 / 3;
+
+        fillRect(black_x, KEYS_Y, black_width, black_height, BLACK_KEY_COLOR);
+    }
+}
+
+void LightUpKey(uint8_t keyIndex, uint16_t color) {
+    if(keyIndex >= NUM_KEYS) return;
+
+    int x = keyIndex * KEY_WIDTH;
+    fillRect(x, KEYS_Y, KEY_WIDTH - 1, KEY_HEIGHT, color);
+
+    for(int i = 0; i < NUM_KEYS - 1; i++) {
+        if(i == 2 || i == 6) continue;
+        int black_x = (i * KEY_WIDTH) + 15;
+        int black_width = 10;
+        int black_height = KEY_HEIGHT * 2 / 3;
+        fillRect(black_x, KEYS_Y, black_width, black_height, BLACK_KEY_COLOR);
+    }
+}
+
+// Function to handle the game animation loop
+void UpdateFallingNotes(void) {
+    uint8_t target_key = demo_song[current_note_idx];
+    int box_x = (target_key * KEY_WIDTH) + 2;
+    int box_w = KEY_WIDTH - 5;
+    int box_h = 10;
+    int drop_speed = 5;
+
+    // Erase the old box position
+    fillRect(box_x, falling_box_y, box_w, box_h, BLACK);
+
+    // Move box down
+    falling_box_y += drop_speed;
+
+    // Check if it hit the keys
+    if (falling_box_y >= KEYS_Y - box_h) {
+        // Hit! Light up the target key
+        LightUpKey(target_key, GREEN);
+        HAL_Delay(250); // Hold the lit key
+
+        // Redraw keys normally
+        DrawPianoKeys();
+
+        // Reset box to top and move to next note
+        falling_box_y = 0;
+        current_note_idx++;
+
+        if (current_note_idx >= sizeof(demo_song)) {
+            current_note_idx = 0; // Loop the song
+        }
+
+        HAL_Delay(300); // Pause before next note falls
+    } else {
+        // Draw the new box position
+        fillRect(box_x, falling_box_y, box_w, box_h, color565(0, 255, 255)); // Cyan box
+        HAL_Delay(30); // Control the framerate of the fall
+    }
 }
 
 

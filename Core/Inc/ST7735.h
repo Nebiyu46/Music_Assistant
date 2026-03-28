@@ -3,10 +3,12 @@
 
 #include "fonts.h"
 #include "stm32f4xx_hal.h"
+#include "stm32f4xx_hal_spi.h"
 #include <stdbool.h>
-
+#include "main.h"
 
 extern SPI_HandleTypeDef hspi1;
+
 #define ST7735_SPI_PORT hspi1
 
 /****** PIN DEFINES ******/

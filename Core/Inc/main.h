@@ -71,6 +71,8 @@ struct {
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define TFT_CS_Pin GPIO_PIN_6
+#define TFT_CS_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
