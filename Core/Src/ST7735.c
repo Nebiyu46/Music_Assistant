@@ -164,6 +164,7 @@ void ST7735_Init(uint8_t rotation)
 {
     ST7735_Select();
     ST7735_Reset();
+    HAL_Delay(120);
     DisplayInit(init_cmds1);
     DisplayInit(init_cmds2);
     DisplayInit(init_cmds3);

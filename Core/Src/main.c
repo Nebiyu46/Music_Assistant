@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32f4xx_hal.h"
 #include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -116,10 +117,48 @@ const CorrectionPoint MIC_RESPONSE[] = {
 #define NUM_KEYS 8
 #define KEY_WIDTH  (DISP_WIDTH / NUM_KEYS)
 #define KEY_HEIGHT 70  // Shorter keys so boxes have room to fall
-#define KEYS_Y     (DISP_HEIGHT - KEY_HEIGHT) // Keys start at y=88
+#define KEYS_Y     (DISP_HEIGHT - KEY_HEIGHT) // Keys start at y=58
 #define WHITE_KEY_COLOR WHITE
 #define BLACK_KEY_COLOR BLACK
 #define GREY_TEXT color565(128, 128, 128)
+
+// === Falling-notes / pitch-sync tunables =================================
+#define LEAD_TIME_MS         1500   // brick fall duration (top -> key bar)
+#define AUDIO_WINDOW_MS      342    // ~1000 * FFT_LENGTH / sample_rate
+#define GRACE_AFTER_PLAY_MS  200    // forgiveness past the note's end
+#define MAX_BRICKS           8      // simultaneous in-flight bricks
+#define RENDER_INTERVAL_MS   25     // ~40 fps cap to limit SPI churn
+#define USE_YIN              0      // 0: FFT-only validation
+#define FFT_WINDOW_COHERENT_GAIN 0.5f // Hann window peak-amplitude gain
+#define FFT_PEAK_THRESHOLD   (3500000.0f * FFT_WINDOW_COHERENT_GAIN * FFT_WINDOW_COHERENT_GAIN) // ignore FFT peaks below this
+
+// Brick visual config
+#define BRICK_PENDING_COLOR  CYAN
+#define BRICK_HIT_COLOR      GREEN
+#define BRICK_MISS_COLOR     RED
+#define MIN_BRICK_HEIGHT     4
+
+// === Active-brick state =================================================
+typedef struct {
+    uint8_t  active;        // 1 if slot in use
+    uint16_t note_idx;      // index into Song_t.notes
+    int16_t  prev_y_top;    // last drawn y_top (for erase)
+    int16_t  prev_height;   // last drawn height (for erase)
+    uint8_t  hit_status;    // 0=in-flight, 1=hit, 2=missed-pending
+} ActiveBrick_t;
+
+static ActiveBrick_t bricks[MAX_BRICKS];
+
+// === Song clock state ===================================================
+static uint32_t song_origin_ms   = 0;
+static uint32_t paused_total_ms  = 0;
+static uint32_t pause_start_ms   = 0;
+static uint8_t  is_paused        = 0;
+static uint8_t  song_started     = 0;
+
+static uint16_t next_spawn_idx     = 0;  // next note eligible to spawn
+static uint16_t expected_idx       = 0;  // next note that must be hit to advance
+static uint8_t  current_section    = 0;  // currently displayed section
 
 // 2. The Raw Text Buffer (4KB is plenty for ~200 notes)
 char usb_rx_buffer[4096]; 
@@ -157,6 +196,7 @@ volatile int buffer_ready_flag = 0;
 float32_t input_buffer[FFT_LENGTH]; 
 float32_t yin_input_buffer[FFT_LENGTH]; // For YIN, we only need half the length of the FFT input
 float32_t first_400_for_Debugging[400];
+float32_t fft_window[FFT_LENGTH];
 
 // Output: The FFT writes raw complex data here. 
 // Note: It needs the same size as input for the RFFT fast implementation
@@ -177,14 +217,14 @@ float32_t magnitude_buffer[FFT_LENGTH / 2];
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+SD_HandleTypeDef hsd;
+
 SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
-uint8_t demo_song[] = {2, 1, 0, 1, 2, 2, 2};
-int current_note_idx = 0;
-int falling_box_y = 0;
+extern const Song_t demo_song;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -194,18 +234,28 @@ static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_SDIO_SD_Init(void);
 /* USER CODE BEGIN PFP */
 
 //uint32_t Mic_Read_Single_Sample(void);
 void DSP_Init();
 void Process_Audio(float32_t* output_array);
+void Apply_FFT_Window(float32_t* samples);
 void Get_Note_Name(float freq, char* output_buffer, int* midi_note);
 void Apply_Mic_Correction(float32_t* mag_buffer, float sample_rate, int fft_length);
 void Send_Data_To_PC(float32_t* data_array, int length, int save_number);
 void YIN_GetPitch(float* input_buffer, int buffer_len, int sample_rate, float32_t* output_array);
 void DrawPianoKeys(void);
+void DrawPianoKeysSection(const SongSection_t* section);
 void LightUpKey(uint8_t keyIndex, uint16_t color);
-void UpdateFallingNotes(void) ;
+void StartSong(void);
+int32_t SongTimeMs(void);
+void PauseSong(void);
+void ResumeSong(void);
+void SpawnBricks(void);
+void PauseExpectedBrickIfDue(void);
+void RenderBricks(void);
+void ValidateBricks(const float32_t* yin_peaks, const float32_t* fft_peaks, int n_peaks);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -248,16 +298,13 @@ int main(void)
   MX_USB_DEVICE_Init();
   MX_TIM2_Init();
   MX_SPI1_Init();
+  //MX_SDIO_SD_Init();
   /* USER CODE BEGIN 2 */
   DSP_Init();
   ST7735_Init(1);
   fillScreen(BLACK);
-  DrawPianoKeys();
-//int indexx = 0;
-//  int thirdd = 0;
-  
-  volatile int send_data_flag = 0;
-
+  DrawPianoKeysSection(&demo_song.sections[0]);
+  StartSong();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -269,64 +316,66 @@ int main(void)
     //}
     //send_data_flag --;
     
-    HAL_ADC_Start_DMA(&hadc1,adc_dma_buffer,FFT_LENGTH);
+    HAL_ADC_Start_DMA(&hadc1, adc_dma_buffer, FFT_LENGTH);
     HAL_TIM_Base_Start(&htim2);
 
-    
+    // Animate falling bricks while the ADC fills its DMA buffer.
     while (buffer_ready_flag == 0) {
-      UpdateFallingNotes();
-      // Wait for DMA to complete
+      SpawnBricks();
+      PauseExpectedBrickIfDue();
+      RenderBricks();
     }
-    //copy dma buffer to input buffer
-    //float32_t current;
-    
+
     for (int i = 0; i < FFT_LENGTH; i++) {
-      input_buffer[i] = (float)adc_dma_buffer[i]-2048; // Center around 0  
-      yin_input_buffer[i] = ((float)adc_dma_buffer[i] - 2048.0f) / 2048.0f; // Copy to YIN buffer as well
-
+      input_buffer[i]     = (float)adc_dma_buffer[i] - 2048;
+      yin_input_buffer[i] = ((float)adc_dma_buffer[i] - 2048.0f) / 2048.0f;
     }
-    
-    
-    buffer_ready_flag = 0; // Clear flag for next round
-    
-    
-    //continue;
-    float32_t peaks_from_fft[(int)numb_notes/2];
-    float32_t peaks_from_yin[(int)numb_notes/2];
+    buffer_ready_flag = 0;
 
-    YIN_GetPitch(yin_input_buffer,FFT_LENGTH,12000, peaks_from_yin);
+    int n_peaks = (int)numb_notes / 2;
+    float32_t peaks_from_fft[(int)numb_notes / 2];
+    float32_t peaks_from_yin[(int)numb_notes / 2];
 
+    #if USE_YIN
+    YIN_GetPitch(yin_input_buffer, FFT_LENGTH, 12000, peaks_from_yin);
+    #else
+    for (int i = 0; i < n_peaks; i++) {
+      peaks_from_yin[i] = 0.0f;
+    }
+    #endif
     Process_Audio(peaks_from_fft);
-    char msg[128];
-    char mssg[128];
-    int yin_len = sprintf(msg, "YIN Dominant Frequency: %.2f Hz , %.2f Hz, %.2f Hz\r\n", peaks_from_yin[0], peaks_from_yin[1], peaks_from_yin[2]);
-    CDC_Transmit_FS((uint8_t*)msg, yin_len);
-    HAL_Delay(5);
-    int fft_len = sprintf(mssg, "FFT Dominant Frequency: %.2f Hz , %.2f Hz, %.2f Hz\r\n", peaks_from_fft[0], peaks_from_fft[1], peaks_from_fft[2]);
-    CDC_Transmit_FS((uint8_t*)mssg, fft_len);
-    HAL_Delay(5);
 
-    char yin_notes[(int)numb_notes/2][5];
-    char fft_notes[(int)numb_notes/2][5];
+    // Hand the candidates to the brick validator (Synthesia-style waiting).
+    ValidateBricks(USE_YIN ? peaks_from_yin : NULL, peaks_from_fft, n_peaks);
 
-    char yin_note_str[10];
-    char yin_usb_msg[64];
-    int yin_midi_num;
-    
-    char fft_note_str[10];
-    char fft_usb_msg[64];
-    int fft_midi_num;
+#ifdef DEBUG_USB
+    {
+      char msg[128];
+      int len;
+      len = sprintf(msg, "YIN: %.2f Hz, %.2f Hz, %.2f Hz\r\n",
+                    peaks_from_yin[0], peaks_from_yin[1], peaks_from_yin[2]);
+      CDC_Transmit_FS((uint8_t*)msg, len);
+      HAL_Delay(5);
+      len = sprintf(msg, "FFT: %.2f Hz, %.2f Hz, %.2f Hz\r\n",
+                    peaks_from_fft[0], peaks_from_fft[1], peaks_from_fft[2]);
+      CDC_Transmit_FS((uint8_t*)msg, len);
+      HAL_Delay(5);
 
-    for (int i = 0; i < numb_notes/2; i++){
-      Get_Note_Name(peaks_from_fft[i], fft_notes[i], &fft_midi_num);
-      Get_Note_Name(peaks_from_yin[i], yin_notes[i], &yin_midi_num);
+      char yin_notes[(int)numb_notes / 2][5];
+      char fft_notes[(int)numb_notes / 2][5];
+      int  midi_dummy;
+      for (int i = 0; i < n_peaks; i++) {
+        Get_Note_Name(peaks_from_fft[i], fft_notes[i], &midi_dummy);
+        Get_Note_Name(peaks_from_yin[i], yin_notes[i], &midi_dummy);
+      }
+      len = sprintf(msg, "YIN notes: %s, %s, %s | FFT notes: %s, %s, %s | exp=%u paused=%u\r\n",
+                    yin_notes[0], yin_notes[1], yin_notes[2],
+                    fft_notes[0], fft_notes[1], fft_notes[2],
+                    (unsigned)expected_idx, (unsigned)is_paused);
+      CDC_Transmit_FS((uint8_t*)msg, len);
+      HAL_Delay(5);
     }
-    int yin_leng = sprintf(yin_usb_msg, "YIN Note 1: %s , Note 2: %s, Note 3: %s", yin_notes[0], yin_notes[1], yin_notes[2]);
-    int fft_leng = sprintf(fft_usb_msg, "FFT Note 1: %s, Note 2: %s, Note 3: %s", fft_notes[0], fft_notes[1], fft_notes[2]);
-    CDC_Transmit_FS((uint8_t*)yin_usb_msg, yin_leng);
-    HAL_Delay(5);
-    CDC_Transmit_FS((uint8_t*)fft_usb_msg, fft_leng);
-    HAL_Delay(5);
+#endif
         
     /*
    if (indexx >= FFT_LENGTH) {
@@ -503,6 +552,42 @@ static void MX_ADC1_Init(void)
 }
 
 /**
+  * @brief SDIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SDIO_SD_Init(void)
+{
+
+  /* USER CODE BEGIN SDIO_Init 0 */
+
+  /* USER CODE END SDIO_Init 0 */
+
+  /* USER CODE BEGIN SDIO_Init 1 */
+
+  /* USER CODE END SDIO_Init 1 */
+  hsd.Instance = SDIO;
+  hsd.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
+  hsd.Init.ClockBypass = SDIO_CLOCK_BYPASS_DISABLE;
+  hsd.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
+  hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
+  hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
+  hsd.Init.ClockDiv = 0;
+  if (HAL_SD_Init(&hsd) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SDIO_Init 2 */
+
+  /* USER CODE END SDIO_Init 2 */
+
+}
+
+/**
   * @brief SPI1 Initialization Function
   * @param None
   * @retval None
@@ -619,24 +704,24 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2|GPIO_PIN_10|TFT_RES_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(TFT_CS_GPIO_Port, TFT_CS_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13|TFT_DC_Pin|TFT_CS_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : PA2 PA9 PA10 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_9|GPIO_PIN_10;
+  /*Configure GPIO pins : PA2 PA10 TFT_RES_Pin */
+  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_10|TFT_RES_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : TFT_CS_Pin */
-  GPIO_InitStruct.Pin = TFT_CS_Pin;
+  /*Configure GPIO pins : PB13 TFT_DC_Pin TFT_CS_Pin */
+  GPIO_InitStruct.Pin = GPIO_PIN_13|TFT_DC_Pin|TFT_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(TFT_CS_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -730,10 +815,21 @@ void Parse_Song_From_Buffer(void) {
 void DSP_Init() {
     // Initialize any DSP-related structures or settings here
     arm_rfft_fast_init_f32(&fft_handler, FFT_LENGTH);
+
+    for (int i = 0; i < FFT_LENGTH; i++) {
+        fft_window[i] = 0.5f * (1.0f - arm_cos_f32((2.0f * PI * (float32_t)i) / (float32_t)(FFT_LENGTH - 1)));
+    }
+}
+
+void Apply_FFT_Window(float32_t* samples) {
+    for (int i = 0; i < FFT_LENGTH; i++) {
+        samples[i] *= fft_window[i];
+    }
 }
 
 void Process_Audio(float32_t* output_array) {
     // 1. FFT and Magnitude
+    Apply_FFT_Window(input_buffer);
     arm_rfft_fast_f32(&fft_handler, input_buffer, fft_output_buffer, 0);
     arm_cmplx_mag_f32(fft_output_buffer, magnitude_buffer, FFT_LENGTH / 2);
 
@@ -748,15 +844,15 @@ void Process_Audio(float32_t* output_array) {
     } 
     
     */
-    Apply_Mic_Correction(magnitude_buffer, 12000.0f, FFT_LENGTH); // Apply mic correction before peak detection
+    //Apply_Mic_Correction(magnitude_buffer, 12000.0f, FFT_LENGTH); // Apply mic correction before peak detection
 
     // 2. UNIFORM HPS (Order 2 Only)
     // We only multiply f * 2f. 
     // This gives us consistent scores from 0Hz up to 3000Hz.
-    /*
-    for (int i = 1; i< limit_3x; i++) {
-        magnitude_buffer[i] *= magnitude_buffer[i*3]*magnitude_buffer[i*2]; // HPS Order 3 (Cubed)
+    for (int i = 1; i< limit_2x; i++) {
+        magnitude_buffer[i] *= magnitude_buffer[i*2]; // HPS Order 3 (Cubed)
     }
+    /*
     for (int i = limit_3x; i < limit_2x; i++) {
         magnitude_buffer[i] *= magnitude_buffer[i*2];
     }
@@ -770,13 +866,19 @@ void Process_Audio(float32_t* output_array) {
     // Search only up to limit_2x (3000Hz)
     
 
-    // 4. AGGRESSIVE OCTAVE CHECK (Fixing C4/C5 Confusion)
-    // Check one octave down
+    // 4. Pick top peaks with a silence gate
     for (int i = 0; i < numb_notes/2; i++) {
       arm_max_f32(&magnitude_buffer[1], len- 1, &max_value, &max_index_raw);
-      output_array[i] = (float)(max_index_raw + 1) * 12000.0f / (float)FFT_LENGTH;
+      if (max_value < FFT_PEAK_THRESHOLD) {
+        output_array[i] = 0.0f;
+      } else {
+        output_array[i] = (float)(max_index_raw + 1) * 12000.0f / (float)FFT_LENGTH;
+      }
       for (int j = -1; j < 3; j++){
-        magnitude_buffer[max_index_raw+j]=0;
+        int idx = (int)max_index_raw + j;
+        if (idx >= 0 && idx < len) {
+          magnitude_buffer[idx] = 0.0f;
+        }
       }      
     }
 
@@ -1048,38 +1150,48 @@ void YIN_GetPitch(float* input_buffer, int buffer_len, int sample_rate, float32_
     //float pitch_in_hz = (float)sample_rate / refined_tau;
 }
 
-void DrawPianoKeys(void) {
-    // 1. Draw 8 White Keys at the bottom
-    for(int i = 0; i < NUM_KEYS; i++) {
+// =============================================================================
+// Piano keyboard drawing
+// =============================================================================
+void DrawPianoKeysSection(const SongSection_t* section) {
+    // 1. White keys + per-section labels
+    static const char* default_labels[NUM_KEYS] = {
+        "C", "D", "E", "F", "G", "A", "B", "C"
+    };
+    for (int i = 0; i < NUM_KEYS; i++) {
         int x = i * KEY_WIDTH;
         fillRect(x, KEYS_Y, KEY_WIDTH - 1, KEY_HEIGHT, WHITE_KEY_COLOR);
 
-        // Label the keys in grey
-        char* notes[] = {"C", "D", "E", "F", "G", "A", "B", "C"};
-        // Note: If Font_7x10 causes an error, your font might be named differently.
-        ST7735_WriteString(x + 5, KEYS_Y + 20, notes[i], Font_7x10, GREY_TEXT, WHITE_KEY_COLOR);
+        const char* label = default_labels[i];
+        if (section && section->labels[i]) {
+            label = section->labels[i];
+        }
+        ST7735_WriteString(x + 5, KEYS_Y + 20, (char*)label,
+                           Font_7x10, GREY_TEXT, WHITE_KEY_COLOR);
     }
 
-    // 2. Draw the Black Keys on top
-    for(int i = 0; i < NUM_KEYS - 1; i++) {
-        if(i == 2 || i == 6) continue;
-
+    // 2. Black keys overlaid (no black key between E-F at i=2 and B-C at i=6)
+    for (int i = 0; i < NUM_KEYS - 1; i++) {
+        if (i == 2 || i == 6) continue;
         int black_x = (i * KEY_WIDTH) + 15;
         int black_width = 10;
         int black_height = KEY_HEIGHT * 2 / 3;
-
         fillRect(black_x, KEYS_Y, black_width, black_height, BLACK_KEY_COLOR);
     }
 }
 
+void DrawPianoKeys(void) {
+    DrawPianoKeysSection(NULL);
+}
+
 void LightUpKey(uint8_t keyIndex, uint16_t color) {
-    if(keyIndex >= NUM_KEYS) return;
+    if (keyIndex >= NUM_KEYS) return;
 
     int x = keyIndex * KEY_WIDTH;
     fillRect(x, KEYS_Y, KEY_WIDTH - 1, KEY_HEIGHT, color);
 
-    for(int i = 0; i < NUM_KEYS - 1; i++) {
-        if(i == 2 || i == 6) continue;
+    for (int i = 0; i < NUM_KEYS - 1; i++) {
+        if (i == 2 || i == 6) continue;
         int black_x = (i * KEY_WIDTH) + 15;
         int black_width = 10;
         int black_height = KEY_HEIGHT * 2 / 3;
@@ -1087,45 +1199,313 @@ void LightUpKey(uint8_t keyIndex, uint16_t color) {
     }
 }
 
-// Function to handle the game animation loop
-void UpdateFallingNotes(void) {
-    uint8_t target_key = demo_song[current_note_idx];
-    int box_x = (target_key * KEY_WIDTH) + 2;
-    int box_w = KEY_WIDTH - 5;
-    int box_h = 10;
-    int drop_speed = 5;
-
-    // Erase the old box position
-    fillRect(box_x, falling_box_y, box_w, box_h, BLACK);
-
-    // Move box down
-    falling_box_y += drop_speed;
-
-    // Check if it hit the keys
-    if (falling_box_y >= KEYS_Y - box_h) {
-        // Hit! Light up the target key
-        LightUpKey(target_key, GREEN);
-        HAL_Delay(250); // Hold the lit key
-
-        // Redraw keys normally
-        DrawPianoKeys();
-
-        // Reset box to top and move to next note
-        falling_box_y = 0;
-        current_note_idx++;
-
-        if (current_note_idx >= sizeof(demo_song)) {
-            current_note_idx = 0; // Loop the song
-        }
-
-        HAL_Delay(300); // Pause before next note falls
-    } else {
-        // Draw the new box position
-        fillRect(box_x, falling_box_y, box_w, box_h, color565(0, 255, 255)); // Cyan box
-        HAL_Delay(30); // Control the framerate of the fall
+// =============================================================================
+// Song clock
+// =============================================================================
+void StartSong(void) {
+    song_origin_ms   = HAL_GetTick();
+    paused_total_ms  = 0;
+    pause_start_ms   = 0;
+    is_paused        = 0;
+    song_started     = 1;
+    next_spawn_idx   = 0;
+    expected_idx     = 0;
+    current_section  = 0;
+    for (int i = 0; i < MAX_BRICKS; i++) {
+        bricks[i].active       = 0;
+        bricks[i].note_idx     = 0;
+        bricks[i].prev_y_top   = 0;
+        bricks[i].prev_height  = 0;
+        bricks[i].hit_status   = 0;
     }
 }
 
+int32_t SongTimeMs(void) {
+    if (!song_started) return 0;
+    uint32_t now = HAL_GetTick();
+    uint32_t reference = is_paused ? pause_start_ms : now;
+    return (int32_t)(reference - song_origin_ms - paused_total_ms);
+}
+
+void PauseSong(void) {
+    if (is_paused) return;
+    pause_start_ms = HAL_GetTick();
+    is_paused = 1;
+}
+
+void ResumeSong(void) {
+    if (!is_paused) return;
+    paused_total_ms += (HAL_GetTick() - pause_start_ms);
+    is_paused = 0;
+}
+
+// =============================================================================
+// SpawnBricks: walk the song forward, instantiate bricks as they enter the
+// lead-time window. Blocked while paused (so nothing past the stuck note
+// can scroll into view).
+// =============================================================================
+void SpawnBricks(void) {
+    if (!song_started || is_paused) return;
+    int32_t t_song = SongTimeMs();
+
+    while (next_spawn_idx < demo_song.note_count) {
+        const SongNote_t* n = &demo_song.notes[next_spawn_idx];
+        int32_t spawn_at = (int32_t)n->start_ms - LEAD_TIME_MS;
+        if (t_song < spawn_at) break;
+
+        int slot = -1;
+        for (int i = 0; i < MAX_BRICKS; i++) {
+            if (!bricks[i].active) { slot = i; break; }
+        }
+        if (slot < 0) break; // all slots full, retry next tick
+
+        bricks[slot].active      = 1;
+        bricks[slot].note_idx    = next_spawn_idx;
+        bricks[slot].prev_y_top  = 0;
+        bricks[slot].prev_height = 0;
+        bricks[slot].hit_status  = 0;
+        next_spawn_idx++;
+    }
+}
+
+// Freeze the expected brick as soon as its bottom reaches the key line.
+// It stays there indefinitely until ValidateBricks sees the expected pitch.
+void PauseExpectedBrickIfDue(void) {
+    if (!song_started || is_paused) return;
+    int32_t t_song = SongTimeMs();
+
+    for (int i = 0; i < MAX_BRICKS; i++) {
+        if (!bricks[i].active) continue;
+        if (bricks[i].note_idx != expected_idx) continue;
+        if (bricks[i].hit_status != 0) return;
+
+        const SongNote_t* n = &demo_song.notes[bricks[i].note_idx];
+        if (t_song >= (int32_t)n->start_ms) {
+            bricks[i].hit_status = 2;
+            PauseSong();
+        }
+        return;
+    }
+}
+
+// =============================================================================
+// RenderBricks: time-based drawing. Position is derived from song_time, never
+// integrated, so a frame skipped during FFT compute auto-corrects on the next
+// render. Frame-rate capped to RENDER_INTERVAL_MS.
+// =============================================================================
+void RenderBricks(void) {
+    static uint32_t last_render_tick = 0;
+    uint32_t now = HAL_GetTick();
+    if ((now - last_render_tick) < RENDER_INTERVAL_MS) return;
+    last_render_tick = now;
+
+    int32_t t_song = SongTimeMs();
+
+    for (int i = 0; i < MAX_BRICKS; i++) {
+        if (!bricks[i].active) continue;
+        const SongNote_t* n = &demo_song.notes[bricks[i].note_idx];
+
+        int32_t spawn_at = (int32_t)n->start_ms - LEAD_TIME_MS;
+        int32_t elapsed  = t_song - spawn_at;
+        if (elapsed < 0) elapsed = 0;
+
+        int32_t y_bottom = (elapsed * KEYS_Y) / LEAD_TIME_MS;
+        int32_t height   = ((int32_t)n->duration_ms * KEYS_Y) / LEAD_TIME_MS;
+        if (height < MIN_BRICK_HEIGHT) height = MIN_BRICK_HEIGHT;
+        int32_t y_top = y_bottom - height;
+
+        // Stick rule: when the song is paused on a missed expected brick,
+        // freeze that brick visibly at the key bar so the user has a target.
+        int is_stuck = is_paused
+                    && (bricks[i].note_idx == expected_idx)
+                    && (bricks[i].hit_status == 2);
+        if (is_stuck) {
+            y_top    = KEYS_Y - height;
+            y_bottom = KEYS_Y;
+        }
+
+        int px = n->key_idx * KEY_WIDTH + 2;
+        int pw = KEY_WIDTH - 5;
+
+        // Erase previous draw rect
+        if (bricks[i].prev_height > 0) {
+            fillRect(px, bricks[i].prev_y_top, pw, bricks[i].prev_height, BLACK);
+            bricks[i].prev_height = 0;
+        }
+
+        // Brick fully past keys -> retire
+        if (y_top >= KEYS_Y) {
+            bricks[i].active = 0;
+            continue;
+        }
+
+        // Clip to fall area [0, KEYS_Y)
+        int32_t draw_top = y_top;
+        int32_t draw_h   = height;
+        if (draw_top < 0) {
+            draw_h += draw_top;
+            draw_top = 0;
+        }
+        if (draw_top + draw_h > KEYS_Y) {
+            draw_h = KEYS_Y - draw_top;
+        }
+        if (draw_h <= 0) continue;
+
+        uint16_t color;
+        switch (bricks[i].hit_status) {
+            case 1:  color = BRICK_HIT_COLOR;     break;
+            case 2:  color = BRICK_MISS_COLOR;    break;
+            default: color = BRICK_PENDING_COLOR; break;
+        }
+
+        fillRect(px, draw_top, pw, draw_h, color);
+        bricks[i].prev_y_top  = (int16_t)draw_top;
+        bricks[i].prev_height = (int16_t)draw_h;
+    }
+}
+
+// =============================================================================
+// ValidateBricks: called once per FFT/YIN cycle. Converts the candidate
+// frequencies into MIDI numbers, then checks every active in-flight brick
+// against the audio window. Marks hit/miss, advances expected_idx, and
+// pauses/resumes the song clock for Synthesia-style waiting.
+// =============================================================================
+void ValidateBricks(const float32_t* yin_peaks, const float32_t* fft_peaks, int n_peaks) {
+    if (!song_started) return;
+
+    int candidates[16];
+    int n_candidates = 0;
+    char dummy[10];
+    int midi;
+
+    for (int i = 0; i < n_peaks; i++) {
+        if (yin_peaks) {
+            Get_Note_Name(yin_peaks[i], dummy, &midi);
+            if (midi >= 0 && n_candidates < 16) candidates[n_candidates++] = midi;
+        }
+        if (fft_peaks) {
+            Get_Note_Name(fft_peaks[i], dummy, &midi);
+            if (midi >= 0 && n_candidates < 16) candidates[n_candidates++] = midi;
+        }
+    }
+
+    int32_t t_song = SongTimeMs();
+    int32_t audio_end   = t_song;
+    int32_t audio_start = t_song - AUDIO_WINDOW_MS;
+
+    // 1) Match audio against every in-flight or stuck brick
+    for (int i = 0; i < MAX_BRICKS; i++) {
+        if (!bricks[i].active) continue;
+        if (bricks[i].hit_status == 1) continue;  // already cleanly hit
+
+        const SongNote_t* n = &demo_song.notes[bricks[i].note_idx];
+        int32_t play_start = (int32_t)n->start_ms;
+        int32_t play_end   = play_start + (int32_t)n->duration_ms + GRACE_AFTER_PLAY_MS;
+
+        int is_stuck         = (bricks[i].hit_status == 2);
+        int audio_before     = (audio_end < play_start);
+        int audio_after      = (audio_start > play_end);
+
+        if (audio_before && !is_stuck) {
+            // Too early to validate this brick
+            continue;
+        }
+        if (audio_after && !is_stuck) {
+            // Play window fully passed without a match -> miss
+            bricks[i].hit_status = 2;
+            if (bricks[i].note_idx == expected_idx) {
+                PauseSong();
+            }
+            continue; // no overlap, can't match on this cycle
+        }
+
+        // Either windows overlap, or this brick is stuck (status==2) and we
+        // are forgiving any later attempt by the user to recover.
+        for (int c = 0; c < n_candidates; c++) {
+            if (candidates[c] == n->midi_note) {
+                bricks[i].hit_status = 1;
+                break;
+            }
+        }
+    }
+
+    // 2) Greedy-advance expected_idx through any consecutive hits
+    while (expected_idx < demo_song.note_count) {
+        int found = -1;
+        for (int i = 0; i < MAX_BRICKS; i++) {
+            if (bricks[i].active && bricks[i].note_idx == expected_idx) {
+                found = i;
+                break;
+            }
+        }
+        if (found < 0) break;                              // brick not active yet
+        if (bricks[found].hit_status != 1) break;          // not yet a clean hit
+        expected_idx++;
+        if (is_paused) ResumeSong();
+    }
+
+    // 3) Section transitions follow the expected_idx cursor
+    while ((current_section + 1) < demo_song.section_count
+           && expected_idx >= demo_song.sections[current_section + 1].first_note_idx) {
+        current_section++;
+        DrawPianoKeysSection(&demo_song.sections[current_section]);
+    }
+}
+
+
+// =============================================================================
+// Demo song: ascending + descending scale in two octaves with a section shift.
+// Stored const, lives in flash. ~32 notes ~ 192 bytes.
+// =============================================================================
+static const SongNote_t demo_song_notes[] = {
+    // ----- Section 0: C4..C5 (MIDI 60..72), 16 notes -----
+    {     0,  500, 60, 0 }, // C4
+    {   700,  500, 62, 1 }, // D4
+    {  1400,  500, 64, 2 }, // E4
+    {  2100,  500, 65, 3 }, // F4
+    {  2800,  500, 67, 4 }, // G4
+    {  3500,  500, 69, 5 }, // A4
+    {  4200,  500, 71, 6 }, // B4
+    {  4900, 1000, 72, 7 }, // C5 (long)
+    {  6300,  500, 72, 7 }, // C5
+    {  7000,  500, 71, 6 }, // B4
+    {  7700,  500, 69, 5 }, // A4
+    {  8400,  500, 67, 4 }, // G4
+    {  9100,  500, 65, 3 }, // F4
+    {  9800,  500, 64, 2 }, // E4
+    { 10500,  500, 62, 1 }, // D4
+    { 11200, 1500, 60, 0 }, // C4 (long final)
+
+    // ----- Section 1: C5..C6 (MIDI 72..84), 16 notes -----
+    { 13000,  500, 72, 0 }, // C5
+    { 13700,  500, 74, 1 }, // D5
+    { 14400,  500, 76, 2 }, // E5
+    { 15100,  500, 77, 3 }, // F5
+    { 15800,  500, 79, 4 }, // G5
+    { 16500,  500, 81, 5 }, // A5
+    { 17200,  500, 83, 6 }, // B5
+    { 17900, 1000, 84, 7 }, // C6 (long)
+    { 19300,  500, 84, 7 }, // C6
+    { 20000,  500, 83, 6 }, // B5
+    { 20700,  500, 81, 5 }, // A5
+    { 21400,  500, 79, 4 }, // G5
+    { 22100,  500, 77, 3 }, // F5
+    { 22800,  500, 76, 2 }, // E5
+    { 23500,  500, 74, 1 }, // D5
+    { 24200, 2000, 72, 0 }, // C5 (long final)
+};
+
+static const SongSection_t demo_song_sections[] = {
+    { 0,  60, { "C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5" } },
+    { 16, 72, { "C5", "D5", "E5", "F5", "G5", "A5", "B5", "C6" } },
+};
+
+const Song_t demo_song = {
+    demo_song_notes,
+    sizeof(demo_song_notes) / sizeof(demo_song_notes[0]),
+    demo_song_sections,
+    sizeof(demo_song_sections) / sizeof(demo_song_sections[0]),
+};
 
 /* USER CODE END 4 */
 

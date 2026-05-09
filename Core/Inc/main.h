@@ -60,17 +60,36 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
 
-struct {
-    uint32_t start_ms;   // When the note starts (in ms)
-    uint8_t  midi_note;  // MIDI Note Number (0-127)
-    uint32_t duration_ms;// Duration of the note (in ms)
-} typedef SongNote_t;
+#define SONG_KEYS_PER_SECTION 8
 
+typedef struct {
+    uint16_t start_ms;      // song-relative onset time
+    uint16_t duration_ms;   // sustain length
+    uint8_t  midi_note;     // exact MIDI value to validate against
+    uint8_t  key_idx;       // 0..SONG_KEYS_PER_SECTION-1 display column
+} SongNote_t;
+
+typedef struct {
+    uint16_t first_note_idx;                       // index into Song_t.notes[]
+    uint8_t  base_midi;                            // for reference / future use
+    const char* labels[SONG_KEYS_PER_SECTION];     // per-key display labels
+} SongSection_t;
+
+typedef struct {
+    const SongNote_t*    notes;
+    uint16_t             note_count;
+    const SongSection_t* sections;
+    uint8_t              section_count;
+} Song_t;
 
 
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define TFT_RES_Pin GPIO_PIN_15
+#define TFT_RES_GPIO_Port GPIOA
+#define TFT_DC_Pin GPIO_PIN_3
+#define TFT_DC_GPIO_Port GPIOB
 #define TFT_CS_Pin GPIO_PIN_6
 #define TFT_CS_GPIO_Port GPIOB
 
