@@ -60,6 +60,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     "${CMAKE_SOURCE_DIR}/Core/Src/ST7735.c"
     "${CMAKE_SOURCE_DIR}/Core/Src/GFX_FUNCTIONS.c"
     "${CMAKE_SOURCE_DIR}/Core/Src/fonts.c"
+    "${CMAKE_SOURCE_DIR}/Drivers/CMSIS_DSP/Source/FastMathFunctions/arm_cos_f32.c"
+    "${CMAKE_SOURCE_DIR}/Drivers/CMSIS_DSP/Source/FastMathFunctions/arm_sin_f32.c"
 )
 
 # Add include paths

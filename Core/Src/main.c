@@ -27,6 +27,7 @@
 #include "usbd_cdc_if.h"
 #include <sys/_intsup.h>
 #include <stdio.h>
+#include <math.h>
 #include "ST7735.h"
 #include "GFX_FUNCTIONS.h"
 #include "stm32f4xx_hal_spi.h" 
@@ -36,6 +37,12 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 extern FontDef Font_7x10;
+extern FontDef Font_11x18;
+
+typedef enum {
+    GAME_STATE_HOME,
+    GAME_STATE_PLAYING
+} GameState_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -129,8 +136,8 @@ const CorrectionPoint MIC_RESPONSE[] = {
 #define MAX_BRICKS           8      // simultaneous in-flight bricks
 #define RENDER_INTERVAL_MS   25     // ~40 fps cap to limit SPI churn
 #define USE_YIN              0      // 0: FFT-only validation
-#define FFT_WINDOW_COHERENT_GAIN 0.5f // Hann window peak-amplitude gain
-#define FFT_PEAK_THRESHOLD   (3500000.0f * FFT_WINDOW_COHERENT_GAIN * FFT_WINDOW_COHERENT_GAIN) // ignore FFT peaks below this
+#define DEBUG_USB            1   
+#define FFT_PEAK_THRESHOLD   3500000.0f // ignore FFT peaks below this
 
 // Brick visual config
 #define BRICK_PENDING_COLOR  CYAN
@@ -196,7 +203,6 @@ volatile int buffer_ready_flag = 0;
 float32_t input_buffer[FFT_LENGTH]; 
 float32_t yin_input_buffer[FFT_LENGTH]; // For YIN, we only need half the length of the FFT input
 float32_t first_400_for_Debugging[400];
-float32_t fft_window[FFT_LENGTH];
 
 // Output: The FFT writes raw complex data here. 
 // Note: It needs the same size as input for the RFFT fast implementation
@@ -225,6 +231,7 @@ TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
 extern const Song_t demo_song;
+static GameState_t game_state = GAME_STATE_HOME;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -240,7 +247,6 @@ static void MX_SDIO_SD_Init(void);
 //uint32_t Mic_Read_Single_Sample(void);
 void DSP_Init();
 void Process_Audio(float32_t* output_array);
-void Apply_FFT_Window(float32_t* samples);
 void Get_Note_Name(float freq, char* output_buffer, int* midi_note);
 void Apply_Mic_Correction(float32_t* mag_buffer, float sample_rate, int fft_length);
 void Send_Data_To_PC(float32_t* data_array, int length, int save_number);
@@ -256,11 +262,124 @@ void SpawnBricks(void);
 void PauseExpectedBrickIfDue(void);
 void RenderBricks(void);
 void ValidateBricks(const float32_t* yin_peaks, const float32_t* fft_peaks, int n_peaks);
+static void InitSheetMusicCurve(void);
+static void DrawStaticUI(void);
+static void AnimateStaff(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/* Home screen (160x25 staff animation at y=3) — matches ST7735 rotation 1 (160x128). */
+#define HOME_COLOR_BLACK   0x0000u
+#define HOME_COLOR_WHITE   0xFFFFu
+#define HOME_COLOR_CYAN    0x07FFu
+#define HOME_COLOR_MAGENTA 0xF81Fu
+#define HOME_COLOR_DARKBG  0x0801u
+#define HOME_ANIM_W        160
+#define HOME_ANIM_H        25
+
+static uint16_t home_anim_buf[HOME_ANIM_W * HOME_ANIM_H];
+static uint16_t home_scroll_frame;
+static int8_t   home_smooth_curve[160];
+
+static void DrawPixelHomeBuf(int16_t x, int16_t y, uint16_t color)
+{
+    if (x >= 0 && x < HOME_ANIM_W && y >= 0 && y < HOME_ANIM_H) {
+        home_anim_buf[(uint16_t)y * HOME_ANIM_W + (uint16_t)x] =
+            (uint16_t)((color >> 8) | (color << 8));
+    }
+}
+
+static void DrawNoteHomeBuf(int16_t x, int16_t y, uint16_t color)
+{
+    for (int dx = 0; dx < 5; dx++) {
+        for (int dy = 0; dy < 4; dy++) {
+            DrawPixelHomeBuf((int16_t)(x + dx + 1), (int16_t)(y + 7 + dy), color);
+        }
+    }
+    for (int dy = 0; dy < 8; dy++) {
+        DrawPixelHomeBuf((int16_t)(x + 5), (int16_t)(y + dy), color);
+        DrawPixelHomeBuf((int16_t)(x + 6), (int16_t)(y + dy), color);
+    }
+    for (int dx = 0; dx < 7; dx++) {
+        DrawPixelHomeBuf((int16_t)(x + 5 + dx), y, color);
+        DrawPixelHomeBuf((int16_t)(x + 5 + dx), (int16_t)(y + 1), color);
+    }
+}
+
+static void DrawStaticUI(void)
+{
+    ST7735_FillScreen(HOME_COLOR_BLACK);
+    ST7735_FillRectangle(0, 0, 160, 3, HOME_COLOR_MAGENTA);
+    ST7735_FillRectangle(0, 28, 160, 1, HOME_COLOR_CYAN);
+    ST7735_FillRectangle(0, 29, 160, 42, HOME_COLOR_BLACK);
+    ST7735_WriteString(53, 33, "PIANO", Font_11x18, HOME_COLOR_MAGENTA, HOME_COLOR_BLACK);
+    ST7735_WriteString(52, 32, "PIANO", Font_11x18, HOME_COLOR_CYAN, HOME_COLOR_BLACK);
+    ST7735_FillRectangle(40, 53, 80, 1, HOME_COLOR_CYAN);
+    ST7735_WriteString(55, 57, "TRAINER", Font_7x10, HOME_COLOR_CYAN, HOME_COLOR_BLACK);
+    ST7735_FillRectangle(0, 71, 160, 1, HOME_COLOR_CYAN);
+    ST7735_FillRectangle(0, 72, 160, 2, HOME_COLOR_MAGENTA);
+    ST7735_FillRectangle(0, 74, 160, 23, HOME_COLOR_DARKBG);
+    for (int i = 0; i < 10; i++) {
+        ST7735_FillRectangle((uint16_t)(10 + (i * 15)), (uint16_t)((i % 2 == 0) ? 80 : 86), 2, 2,
+                             (uint16_t)((i % 2 == 0) ? HOME_COLOR_MAGENTA : HOME_COLOR_CYAN));
+    }
+    ST7735_WriteString(27, 81, "> PRESS START <", Font_7x10, HOME_COLOR_MAGENTA, HOME_COLOR_DARKBG);
+    ST7735_FillRectangle(0, 97, 160, 2, HOME_COLOR_MAGENTA);
+    ST7735_FillRectangle(0, 99, 160, 1, HOME_COLOR_CYAN);
+    ST7735_FillRectangle(0, 100, 160, 28, HOME_COLOR_WHITE);
+    for (int i = 1; i < 20; i++) {
+        ST7735_FillRectangle((uint16_t)(i * 8), 100, 1, 28, HOME_COLOR_BLACK);
+    }
+    int bk_pattern[] = {1, 1, 0, 1, 1, 1, 0};
+    for (int i = 0; i < 19; i++) {
+        if (bk_pattern[i % 7] == 1) {
+            ST7735_FillRectangle((uint16_t)((i * 8) + 5), 100, 5, 16, HOME_COLOR_BLACK);
+        }
+    }
+    ST7735_FillRectangle(0, 100, 160, 1, HOME_COLOR_BLACK);
+}
+
+static void InitSheetMusicCurve(void)
+{
+    for (int i = 0; i < 160; i++) {
+        home_smooth_curve[i] = (int8_t)(sinf((float)i * 2.0f * 3.14159265f / 160.0f) * 3.0f);
+    }
+    home_scroll_frame = 0;
+}
+
+static void AnimateStaff(void)
+{
+    for (int i = 0; i < HOME_ANIM_W * HOME_ANIM_H; i++) {
+        home_anim_buf[i] = (uint16_t)((HOME_COLOR_DARKBG >> 8) | (HOME_COLOR_DARKBG << 8));
+    }
+    home_scroll_frame++;
+    for (int x = 0; x < HOME_ANIM_W; x++) {
+        int idx = (x + (int)home_scroll_frame) % 160;
+        int y_offset = home_smooth_curve[idx];
+        for (int line = 0; line < 3; line++) {
+            int base_y = 8 + (line * 6);
+            DrawPixelHomeBuf((int16_t)x, (int16_t)(base_y + y_offset), HOME_COLOR_CYAN);
+        }
+    }
+    for (int i = 0; i < 5; i++) {
+        int x_pos = (int)((i * 40 - (int)home_scroll_frame) % 200);
+        if (x_pos < 0) {
+            x_pos += 200;
+        }
+        x_pos -= 20;
+        int curve_idx = (x_pos + (int)home_scroll_frame) % 160;
+        if (curve_idx < 0) {
+            curve_idx += 160;
+        }
+        int y_offset = home_smooth_curve[curve_idx];
+        uint16_t note_color = (uint16_t)((i % 2 == 0) ? HOME_COLOR_MAGENTA : HOME_COLOR_WHITE);
+        int note_y = (i % 3) * 6;
+        DrawNoteHomeBuf((int16_t)x_pos, (int16_t)(note_y + y_offset), note_color);
+    }
+    ST7735_DrawImage(0, 3, HOME_ANIM_W, HOME_ANIM_H, home_anim_buf);
+}
 
 /* USER CODE END 0 */
 
@@ -302,15 +421,30 @@ int main(void)
   /* USER CODE BEGIN 2 */
   DSP_Init();
   ST7735_Init(1);
-  fillScreen(BLACK);
-  DrawPianoKeysSection(&demo_song.sections[0]);
-  StartSong();
+  InitSheetMusicCurve();
+  DrawStaticUI();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
-  { 
+  {
+    if (game_state == GAME_STATE_HOME) {
+      AnimateStaff();
+      HAL_Delay(50);
+      if (HAL_GPIO_ReadPin(START_GAME_GPIO_Port, START_GAME_Pin) == GPIO_PIN_RESET) {
+        HAL_Delay(40);
+        while (HAL_GPIO_ReadPin(START_GAME_GPIO_Port, START_GAME_Pin) == GPIO_PIN_RESET) {
+          HAL_Delay(10);
+        }
+        fillScreen(BLACK);
+        DrawPianoKeysSection(&demo_song.sections[0]);
+        StartSong();
+        game_state = GAME_STATE_PLAYING;
+      }
+      continue;
+    }
+
     //if (send_data_flag < 1) {
       //continue;
     //}
@@ -724,7 +858,11 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
+  GPIO_InitStruct.Pin = START_GAME_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(START_GAME_GPIO_Port, &GPIO_InitStruct);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -815,21 +953,10 @@ void Parse_Song_From_Buffer(void) {
 void DSP_Init() {
     // Initialize any DSP-related structures or settings here
     arm_rfft_fast_init_f32(&fft_handler, FFT_LENGTH);
-
-    for (int i = 0; i < FFT_LENGTH; i++) {
-        fft_window[i] = 0.5f * (1.0f - arm_cos_f32((2.0f * PI * (float32_t)i) / (float32_t)(FFT_LENGTH - 1)));
-    }
-}
-
-void Apply_FFT_Window(float32_t* samples) {
-    for (int i = 0; i < FFT_LENGTH; i++) {
-        samples[i] *= fft_window[i];
-    }
 }
 
 void Process_Audio(float32_t* output_array) {
     // 1. FFT and Magnitude
-    Apply_FFT_Window(input_buffer);
     arm_rfft_fast_f32(&fft_handler, input_buffer, fft_output_buffer, 0);
     arm_cmplx_mag_f32(fft_output_buffer, magnitude_buffer, FFT_LENGTH / 2);
 
@@ -1458,41 +1585,42 @@ void ValidateBricks(const float32_t* yin_peaks, const float32_t* fft_peaks, int 
 // Stored const, lives in flash. ~32 notes ~ 192 bytes.
 // =============================================================================
 static const SongNote_t demo_song_notes[] = {
-    // ----- Section 0: C4..C5 (MIDI 60..72), 16 notes -----
-    {     0,  500, 60, 0 }, // C4
-    {   700,  500, 62, 1 }, // D4
-    {  1400,  500, 64, 2 }, // E4
-    {  2100,  500, 65, 3 }, // F4
-    {  2800,  500, 67, 4 }, // G4
-    {  3500,  500, 69, 5 }, // A4
-    {  4200,  500, 71, 6 }, // B4
-    {  4900, 1000, 72, 7 }, // C5 (long)
-    {  6300,  500, 72, 7 }, // C5
-    {  7000,  500, 71, 6 }, // B4
-    {  7700,  500, 69, 5 }, // A4
-    {  8400,  500, 67, 4 }, // G4
-    {  9100,  500, 65, 3 }, // F4
-    {  9800,  500, 64, 2 }, // E4
-    { 10500,  500, 62, 1 }, // D4
-    { 11200, 1500, 60, 0 }, // C4 (long final)
+    // ----- Happy Birthday (Spans G4 to G5) -----
+    // Note: Higher octave notes (D5, E5, etc.) wrap back to indices 1-4 
+    // so they still light up the correct keys on your 8-key UI.
 
-    // ----- Section 1: C5..C6 (MIDI 72..84), 16 notes -----
-    { 13000,  500, 72, 0 }, // C5
-    { 13700,  500, 74, 1 }, // D5
-    { 14400,  500, 76, 2 }, // E5
-    { 15100,  500, 77, 3 }, // F5
-    { 15800,  500, 79, 4 }, // G5
-    { 16500,  500, 81, 5 }, // A5
-    { 17200,  500, 83, 6 }, // B5
-    { 17900, 1000, 84, 7 }, // C6 (long)
-    { 19300,  500, 84, 7 }, // C6
-    { 20000,  500, 83, 6 }, // B5
-    { 20700,  500, 81, 5 }, // A5
-    { 21400,  500, 79, 4 }, // G5
-    { 22100,  500, 77, 3 }, // F5
-    { 22800,  500, 76, 2 }, // E5
-    { 23500,  500, 74, 1 }, // D5
-    { 24200, 2000, 72, 0 }, // C5 (long final)
+    // "Happy birthday to you"
+    {     0,  250, 67, 4 }, // G4
+    {   250,  250, 67, 4 }, // G4
+    {   500,  500, 69, 5 }, // A4
+    {  1000,  500, 67, 4 }, // G4
+    {  1500,  500, 72, 7 }, // C5
+    {  2000, 1000, 71, 6 }, // B4
+
+    // "Happy birthday to you"
+    {  3000,  250, 67, 4 }, // G4
+    {  3250,  250, 67, 4 }, // G4
+    {  3500,  500, 69, 5 }, // A4
+    {  4000,  500, 67, 4 }, // G4
+    {  4500,  500, 74, 1 }, // D5 (wrapped to index 1)
+    {  5000, 1000, 72, 7 }, // C5
+
+    // "Happy birthday dear [Name]"
+    {  6000,  250, 67, 4 }, // G4
+    {  6250,  250, 67, 4 }, // G4
+    {  6500,  500, 79, 4 }, // G5 (wrapped to index 4)
+    {  7000,  500, 76, 2 }, // E5 (wrapped to index 2)
+    {  7500,  500, 72, 7 }, // C5
+    {  8000,  500, 71, 6 }, // B4
+    {  8500, 1000, 69, 5 }, // A4
+
+    // "Happy birthday to you"
+    {  9500,  250, 77, 3 }, // F5 (wrapped to index 3)
+    {  9750,  250, 77, 3 }, // F5
+    { 10000,  500, 76, 2 }, // E5
+    { 10500,  500, 72, 7 }, // C5
+    { 11000,  500, 74, 1 }, // D5
+    { 11500, 1500, 72, 7 }, // C5 (long final)
 };
 
 static const SongSection_t demo_song_sections[] = {

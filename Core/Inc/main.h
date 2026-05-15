@@ -93,6 +93,10 @@ typedef struct {
 #define TFT_CS_Pin GPIO_PIN_6
 #define TFT_CS_GPIO_Port GPIOB
 
+/* Start: pull this pin to GND to leave the home screen and begin gameplay (internal pull-up). */
+#define START_GAME_GPIO_Port GPIOA
+#define START_GAME_Pin       GPIO_PIN_1
+
 /* USER CODE BEGIN Private defines */
 
 // Max number of notes to store in RAM

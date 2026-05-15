@@ -346,3 +346,47 @@ void ST7735_InvertColors(bool invert) {
 }
 
 
+
+void ST7735_FillScreen(uint16_t color) {
+    ST7735_FillRectangle(0, 0, _width, _height, color);
+}
+void ST7735_DrawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color) {
+    int16_t steep = abs(y1 - y0) > abs(x1 - x0);
+    if (steep) { int16_t t; t=x0; x0=y0; y0=t; t=x1; x1=y1; y1=t; }
+    if (x0 > x1)  { int16_t t; t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t; }
+    int16_t dx = x1-x0, dy = abs(y1-y0);
+    int16_t err = dx/2, ystep = (y0 < y1) ? 1 : -1, y = y0;
+    for (int16_t x = x0; x <= x1; x++) {
+        if (steep) ST7735_DrawPixel(y, x, color);
+        else       ST7735_DrawPixel(x, y, color);
+        err -= dy;
+        if (err < 0) { y += ystep; err += dx; }
+    }
+}
+
+void ST7735_DrawCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color) {
+    int16_t f=1-r, ddF_x=1, ddF_y=-2*r, x=0, y=r;
+    ST7735_DrawPixel(x0, y0+r, color); ST7735_DrawPixel(x0, y0-r, color);
+    ST7735_DrawPixel(x0+r, y0, color); ST7735_DrawPixel(x0-r, y0, color);
+    while (x < y) {
+        if (f >= 0) { y--; ddF_y+=2; f+=ddF_y; }
+        x++; ddF_x+=2; f+=ddF_x;
+        ST7735_DrawPixel(x0+x,y0+y,color); ST7735_DrawPixel(x0-x,y0+y,color);
+        ST7735_DrawPixel(x0+x,y0-y,color); ST7735_DrawPixel(x0-x,y0-y,color);
+        ST7735_DrawPixel(x0+y,y0+x,color); ST7735_DrawPixel(x0-y,y0+x,color);
+        ST7735_DrawPixel(x0+y,y0-x,color); ST7735_DrawPixel(x0-y,y0-x,color);
+    }
+}
+static int16_t sqrt_int(int32_t n) {
+    int16_t x = 0;
+    while ((x+1)*(x+1) <= n) x++;
+    return x;
+}
+void ST7735_FillCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color) {
+    ST7735_FillRectangle(x0-r, y0, 2*r+1, 1, color);
+    for (int16_t i=1; i<=r; i++) {
+        int16_t w = (int16_t)(2 * sqrt_int(r*r - i*i) + 1);
+        ST7735_FillRectangle(x0 - w/2, y0-i, w, 1, color);
+        ST7735_FillRectangle(x0 - w/2, y0+i, w, 1, color);
+    }
+}

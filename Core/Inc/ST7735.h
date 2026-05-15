@@ -6,6 +6,7 @@
 #include "stm32f4xx_hal_spi.h"
 #include <stdbool.h>
 #include "main.h"
+#include <stdlib.h>
 
 extern SPI_HandleTypeDef hspi1;
 
@@ -104,6 +105,9 @@ void ST7735_FillRectangle(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16
 void ST7735_FillScreen(uint16_t color);
 void ST7735_DrawImage(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_t* data);
 void ST7735_InvertColors(bool invert);
+void ST7735_FillCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color);
+void ST7735_DrawCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color);
+void ST7735_DrawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color);
 
 
 
