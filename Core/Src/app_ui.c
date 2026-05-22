@@ -201,14 +201,24 @@ void AppUI_DrawMenu(int8_t selection)
 
 void AppUI_DrawSongList(int8_t selection, const char *const *titles, int count)
 {
+    draw_screen_header("SONGS");
+
+    if (count == 0) {
+        ST7735_WriteString(8,  65, "No songs on SD card", Font_7x10,
+                           HOME_COLOR_MAGENTA, HOME_COLOR_BLACK);
+        ST7735_WriteString(8,  80, "Upload a song first", Font_7x10,
+                           HOME_COLOR_WHITE,   HOME_COLOR_BLACK);
+        ST7735_WriteString(8, 110, "PA1: back",           Font_7x10,
+                           HOME_COLOR_CYAN,    HOME_COLOR_BLACK);
+        return;
+    }
+
     if (selection >= count) {
         selection = 0;
     }
 
-    draw_screen_header("SONGS");
-
     for (int i = 0; i < count; i++) {
-        int16_t y = (int16_t)(52 + (i * 22));
+        int16_t  y  = (int16_t)(52 + (i * 22));
         uint16_t fg = HOME_COLOR_WHITE;
         uint16_t bg = HOME_COLOR_BLACK;
 
@@ -222,7 +232,8 @@ void AppUI_DrawSongList(int8_t selection, const char *const *titles, int count)
         ST7735_WriteString(24, (uint16_t)y, (char *)titles[i], Font_7x10, fg, bg);
     }
 
-    ST7735_WriteString(8, 110, "PA2: move  PA1: play", Font_7x10, HOME_COLOR_CYAN, HOME_COLOR_BLACK);
+    ST7735_WriteString(8, 110, "PA2: move  PA1: play", Font_7x10,
+                       HOME_COLOR_CYAN, HOME_COLOR_BLACK);
 }
 
 void AppUI_DrawUploadWait(void)

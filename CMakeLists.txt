@@ -12,7 +12,6 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 
-
 # Define the build type
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Debug")
@@ -69,6 +68,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     "${CMAKE_SOURCE_DIR}/Core/Src/piano_ui.c"
     "${CMAKE_SOURCE_DIR}/Core/Src/song_storage.c"
     "${CMAKE_SOURCE_DIR}/Core/Src/usb_upload.c"
+    "${CMAKE_SOURCE_DIR}/Core/Src/sd_storage.c"
+    "${CMAKE_SOURCE_DIR}/Core/Src/fatfs_sd.c"
     "${CMAKE_SOURCE_DIR}/Drivers/CMSIS_DSP/Source/FastMathFunctions/arm_cos_f32.c"
     "${CMAKE_SOURCE_DIR}/Drivers/CMSIS_DSP/Source/FastMathFunctions/arm_sin_f32.c"
 )

@@ -11,6 +11,7 @@ uint8_t UsbUpload_IsRxActive(void);
 uint8_t UsbUpload_NeedsParsing(void);
 void    UsbUpload_ClearParsingFlag(void);
 void    UsbUpload_ResetBuffer(void);
-char *UsbUpload_GetBuffer(void);
+char   *UsbUpload_GetBuffer(void);
+uint32_t UsbUpload_GetLength(void);
 
 #endif /* USB_UPLOAD_H */
