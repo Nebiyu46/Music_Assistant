@@ -5,12 +5,10 @@
 
 extern SongNote_t song_notes_ram[MAX_SONG_NOTES];
 
-int  SongStorage_GetParsedCount(void);
+int SongStorage_GetParsedCount(void);
 void SongStorage_ParseFromBuffer(void);
-void SongStorage_FinalizeUploaded(void);
+uint8_t SongStorage_LoadFromSD(const char *filename);
 const Song_t *SongStorage_GetRamSong(void);
-void SongStorage_SetUseUploaded(uint8_t use);
-uint8_t SongStorage_UseUploaded(void);
 const char *SongStorage_GetUploadTitle(void);
 
 #endif /* SONG_STORAGE_H */

@@ -17,28 +17,41 @@ void USB_Data_Receiver(uint8_t *buf, uint32_t len)
         return;
     }
 
-    if (usb_rx_index + (int)len >= (int)sizeof(usb_rx_buffer)) {
-        usb_rx_index = 0;
+    /* Prevent buffer overflow but keep appending */
+    if (usb_rx_index + (int)len >= USB_RX_BUFFER_SIZE) {
+        len = USB_RX_BUFFER_SIZE - 1 - usb_rx_index;
     }
 
     memcpy(&usb_rx_buffer[usb_rx_index], buf, len);
     usb_rx_index += (int)len;
-    if (usb_rx_index >= (int)sizeof(usb_rx_buffer)) {
-        usb_rx_index = (int)sizeof(usb_rx_buffer) - 1;
-    }
     usb_rx_buffer[usb_rx_index] = '\0';
 
     if (!usb_accept_upload) {
         return;
     }
 
-    if (strstr(usb_rx_buffer, "START") != NULL) {
-        usb_rx_index = 0;
-        memset(usb_rx_buffer, 0, sizeof(usb_rx_buffer));
-        usb_rx_active = 1;
-        return;
+    /* Check for START without wiping the real data attached to it */
+    if (!usb_rx_active) {
+        char *start_ptr = strstr(usb_rx_buffer, "START");
+        if (start_ptr != NULL) {
+            usb_rx_active = 1;
+            
+            char *data_start = start_ptr + 5; /* Skip "START" */
+            if (*data_start == '\r') data_start++;
+            if (*data_start == '\n') data_start++;
+
+            int remaining = usb_rx_index - (int)(data_start - usb_rx_buffer);
+            if (remaining > 0) {
+                memmove(usb_rx_buffer, data_start, remaining);
+                usb_rx_index = remaining;
+            } else {
+                usb_rx_index = 0;
+            }
+            usb_rx_buffer[usb_rx_index] = '\0';
+        }
     }
 
+    /* Check for END */
     if (usb_rx_active && strstr(usb_rx_buffer, "END") != NULL) {
         usb_parsing_needed = 1;
     }
@@ -77,8 +90,12 @@ void UsbUpload_ResetBuffer(void)
     usb_rx_active = 0;
 }
 
-/* song_storage.c reads the shared RX buffer via this accessor */
 char *UsbUpload_GetBuffer(void)
 {
     return usb_rx_buffer;
+}
+
+uint32_t UsbUpload_GetLength(void)
+{
+    return (uint32_t)usb_rx_index;
 }

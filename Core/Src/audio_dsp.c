@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FFT_PEAK_THRESHOLD 3500000.0f
+#define FFT_PEAK_THRESHOLD 8000.0f
 #define YIN_THRESHOLD      0.15f
 #define YIN_BUFFER_SIZE    (AUDIO_FFT_LENGTH / 2)
 
@@ -28,14 +28,9 @@ void AudioDSP_Init(void)
 void AudioDSP_ProcessFftPeaks(float32_t *output_array, int peak_count)
 {
     int len = AUDIO_FFT_LENGTH / 2;
-    int limit_2x = len / 2;
 
     arm_rfft_fast_f32(&fft_handler, audio_input_buffer, fft_output_buffer, 0);
     arm_cmplx_mag_f32(fft_output_buffer, magnitude_buffer, len);
-
-    for (int i = 1; i < limit_2x; i++) {
-        magnitude_buffer[i] *= magnitude_buffer[i * 2];
-    }
 
     for (int i = 0; i < peak_count; i++) {
         float32_t max_value;
@@ -56,7 +51,6 @@ void AudioDSP_ProcessFftPeaks(float32_t *output_array, int peak_count)
             }
         }
     }
-
 }
 
 void AudioDSP_GetYinPeaks(float *input_buffer, int buffer_len, float32_t *output_array, int peak_count)
